@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any
+from datetime import date
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -380,4 +381,136 @@ class SequenceResponse(BaseModel):
     steps: list[SequenceStepResult] = Field(description="按顺序的各步推演结果")
     final_inventory: list[SequenceInventoryItem] = Field(
         description="全部步骤执行完毕后的最终物种库存"
+    )
+
+
+# ------------------------------------------------------------ 试剂批次分配
+class BatchInput(BaseModel):
+    """``/inventory/allocate`` 请求中的一条库存批次。"""
+
+    batch_id: str = Field(
+        ...,
+        min_length=1,
+        description="批号；同一请求内必须唯一（重复批号会被拒绝，防止重复扣减）",
+        examples=["B2026-001"],
+    )
+    purity: str = Field(
+        ...,
+        min_length=1,
+        description="纯度，(0, 1] 的十进制字符串（如 \"0.995\"、\"1\"）；"
+        "不要传 JSON 数字以避免浮点误差",
+        examples=["0.995"],
+    )
+    available_moles: str = Field(
+        ...,
+        min_length=1,
+        description="可用名义摩尔数的非负十进制字符串（未乘纯度）；"
+        "不要传 JSON 数字以避免浮点误差",
+        examples=["2.5"],
+    )
+    expiry_date: date = Field(
+        ...,
+        description="失效日期（YYYY-MM-DD）；早于核算日期即视为过期并被跳过，"
+        "核算日期当天到期仍可用",
+        examples=["2026-12-31"],
+    )
+    status: Literal["available", "quarantined"] = Field(
+        ...,
+        description="批次状态：available 可领用 / quarantined 隔离（跳过）",
+        examples=["available"],
+    )
+
+    @field_validator("batch_id", "purity", "available_moles")
+    @classmethod
+    def _strip_text(cls, value: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError("必须是字符串")
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("不能为空白字符串")
+        return stripped
+
+
+class AllocateRequest(BaseModel):
+    """``/inventory/allocate`` 请求：待领用物种、有效摩尔需求、核算日期与库存批次。"""
+
+    species: str = Field(
+        ...,
+        min_length=1,
+        description="待领用物种化学式（等价写法会规范化，如 Ca[OH]2 -> Ca(OH)2）",
+        examples=["NaCl"],
+    )
+    required_moles: str = Field(
+        ...,
+        min_length=1,
+        description="有效摩尔需求（已折算纯度）的严格正十进制字符串；"
+        "不要传 JSON 数字以避免浮点误差",
+        examples=["1.5"],
+    )
+    as_of_date: date = Field(
+        ...,
+        description="核算日期（YYYY-MM-DD）；失效日期早于此日的批次视为过期",
+        examples=["2026-09-23"],
+    )
+    batches: list[BatchInput] = Field(
+        ...,
+        description="库存批次列表；可为空（此时需求全部未满足）",
+    )
+
+    @field_validator("species", "required_moles")
+    @classmethod
+    def _strip_text(cls, value: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError("必须是字符串")
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("不能为空白字符串")
+        return stripped
+
+
+class AllocatedSpecies(BaseModel):
+    input: str = Field(description="客户端提交的原始化学式")
+    normalized: str = Field(description="规范化后的化学式")
+
+
+class AllocationLine(BaseModel):
+    batch_id: str = Field(description="批号（回显）")
+    purity: str = Field(description="纯度（回显客户端提交的原文）")
+    expiry_date: date = Field(description="失效日期（回显，YYYY-MM-DD）")
+    allocated_effective_moles: str = Field(
+        description="从该批领用的有效物质量 = min(剩余需求, 名义量 × 纯度)（mol）"
+    )
+    allocated_nominal_moles: str = Field(
+        description="从该批扣减的名义摩尔数 = 有效领用量 ÷ 纯度（mol）"
+    )
+    remaining_nominal_moles: str = Field(description="该批剩余名义摩尔数（mol）")
+    remaining_effective_moles: str = Field(
+        description="该批剩余有效物质量 = 剩余名义量 × 纯度（mol）"
+    )
+
+
+class SkippedBatch(BaseModel):
+    batch_id: str = Field(description="被跳过批次的批号")
+    reason: str = Field(
+        description="跳过原因：expired（失效日期早于核算日期）/ "
+        "quarantined（批次状态为隔离；同时过期时记为隔离）"
+    )
+
+
+class AllocateResponse(BaseModel):
+    species: AllocatedSpecies
+    required_moles: str = Field(description="有效摩尔需求（回显）")
+    as_of_date: date = Field(description="核算日期（回显，YYYY-MM-DD）")
+    status: str = Field(
+        description="汇总状态：fulfilled 全部满足 / partial 部分满足 / "
+        "unavailable 完全无法分配"
+    )
+    allocated_moles: str = Field(description="已分配的有效物质量合计（mol）")
+    unmet_moles: str = Field(description="未满足的有效摩尔需求（mol）")
+    allocations: list[AllocationLine] = Field(
+        description="全部可领用批次按分配顺序（失效日期升序、同日批号升序）的逐批明细；"
+        "需求满足后未被动用的批次领用量为 0"
+    )
+    skipped_batches: list[SkippedBatch] = Field(
+        description="被跳过的过期 / 隔离批次及原因（按请求顺序）"
     )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date
 from decimal import Decimal, InvalidOperation
 from fractions import Fraction
 from typing import Any
@@ -17,6 +18,12 @@ from .balancer import (
     solve_reaction,
 )
 from .cache import ReactionRecord, build_signature, cache, reaction_id_for, species_key
+from .inventory import (
+    Batch,
+    allocate_batches,
+    parse_positive_moles,
+    parse_purity,
+)
 from .parser import FormulaError, parse_formula
 from .stoichiometry import (
     apply_sequence_step,
@@ -748,4 +755,111 @@ def process_sequence(
     return 200, {
         "steps": step_results,
         "final_inventory": _render_inventory(inventory, normalized_by_key),
+    }
+
+
+# ------------------------------------------------------------ 试剂批次分配
+def process_allocate(
+    species_text: str,
+    required_text: str,
+    as_of: date,
+    batch_items: list[dict[str, Any]],
+) -> tuple[int, dict[str, Any]]:
+    """试剂批次 FEFO 分配，返回 (http_status, payload)。
+
+    待领用物种按化学式解析（等价写法规范化，解析失败 400）；有效摩尔需求
+    必须严格为正；每个批次校验批号唯一、纯度 ∈ (0, 1]、可用名义摩尔数
+    非负——批号重复与所有可定位的数值问题聚合后一次返回 422。随后按
+    失效日期优先、同日批号升序分配，过期与隔离批次跳过。服务无状态：
+    批次库存完全由请求体给出，同一批次在一次请求内只被扣减一次。
+    """
+    try:
+        formula = parse_formula(species_text)
+    except FormulaError as exc:
+        return STATUS_CODES["FORMULA_PARSE_ERROR"], {
+            "error": error_payload(
+                "FORMULA_PARSE_ERROR",
+                str(exc),
+                {"field": "species", "input": species_text},
+            ),
+        }
+
+    try:
+        required = parse_positive_moles(required_text)
+    except (ValueError, InvalidOperation):
+        return STATUS_CODES["INVALID_REQUEST"], {
+            "error": error_payload(
+                "INVALID_REQUEST",
+                "有效摩尔需求 required_moles 必须是严格为正的十进制字符串"
+                "（不能为 JSON 数字）",
+                {"invalid_required_moles": required_text},
+            ),
+        }
+
+    # ---- 批次：批号唯一性 + 数值解析，聚合所有可定位的问题
+    seen_ids: set[str] = set()
+    duplicate_ids: list[str] = []
+    invalid_batches: list[dict[str, str]] = []
+    batches: list[Batch] = []
+
+    for item in batch_items:
+        batch_id = item["batch_id"]
+        if batch_id in seen_ids:
+            duplicate_ids.append(batch_id)
+        seen_ids.add(batch_id)
+
+        purity: Decimal | None
+        nominal: Decimal | None
+        try:
+            purity = parse_purity(item["purity"])
+        except (ValueError, InvalidOperation):
+            invalid_batches.append(
+                {"batch_id": batch_id, "field": "purity", "value": item["purity"]}
+            )
+            purity = None
+        try:
+            nominal = parse_moles(item["available_moles"])
+        except (ValueError, InvalidOperation):
+            invalid_batches.append(
+                {
+                    "batch_id": batch_id,
+                    "field": "available_moles",
+                    "value": item["available_moles"],
+                }
+            )
+            nominal = None
+        if purity is None or nominal is None:
+            continue
+        batches.append(
+            Batch(
+                batch_id=batch_id,
+                purity=decimal_to_fraction(purity),
+                purity_text=item["purity"],
+                nominal=decimal_to_fraction(nominal),
+                expiry_date=item["expiry_date"],
+                status=item["status"],
+            )
+        )
+
+    if duplicate_ids or invalid_batches:
+        details: dict[str, Any] = {}
+        if duplicate_ids:
+            details["duplicate_batch_ids"] = sorted(set(duplicate_ids))
+        if invalid_batches:
+            details["invalid_batches"] = invalid_batches
+        return STATUS_CODES["INVALID_REQUEST"], {
+            "error": error_payload(
+                "INVALID_REQUEST",
+                "批次数据非法：批号必须唯一；纯度必须是 (0, 1] 的十进制字符串；"
+                "可用名义摩尔数必须是非负十进制字符串（不能为 JSON 数字）",
+                details,
+            ),
+        }
+
+    result = allocate_batches(decimal_to_fraction(required), as_of, batches)
+    return 200, {
+        "species": {"input": species_text, "normalized": formula.normalized},
+        "required_moles": required_text,
+        "as_of_date": as_of.isoformat(),
+        **result,
     }

@@ -12,6 +12,9 @@
 * ``POST /stoichiometry/sequence`` 多步连续反应推演：按顺序执行多步
   反应，基于初始物种库存逐步计算最大反应进度、扣减消耗、加入产物，
   返回各步明细与最终库存；
+* ``POST /inventory/allocate`` 试剂批次分配：按失效日期优先（FEFO）、
+  同日批号升序从库存批次领用有效物质（名义量 × 纯度），跳过过期与
+  隔离批次，支持跨批次拆分，返回逐批领用/余量、未满足需求与汇总状态；
 * ``GET  /reactions/{reaction_id}``  按幂等 ID 取回结果；
 * ``GET  /health``   健康检查。
 """
@@ -24,6 +27,8 @@ from fastapi.responses import JSONResponse
 
 from . import __version__
 from .models import (
+    AllocateRequest,
+    AllocateResponse,
     AnalyzeResponse,
     BalanceResponse,
     ReactionRequest,
@@ -39,6 +44,7 @@ from .models import (
 from .service import (
     STATUS_CODES,
     get_reaction,
+    process_allocate,
     process_analyze,
     process_balance,
     process_reverse_plan,
@@ -76,7 +82,8 @@ async def handle_validation_error(request: Request, exc: RequestValidationError)
         content={
             "error": {
                 "code": "INVALID_REQUEST",
-                "message": "请求体校验失败：请提供非空的 reactants 与 products 字符串数组",
+                "message": "请求体校验失败：字段缺失、类型或取值不合法"
+                "（详见 details.validation）",
                 "details": {"validation": _jsonable_errors(exc.errors())},
             }
         },
@@ -186,6 +193,26 @@ async def stoichiometry_sequence(request: SequenceRequest):
     status, payload = process_sequence(
         [item.model_dump() for item in request.steps],
         [item.model_dump() for item in request.initial_inventory],
+    )
+    return JSONResponse(status_code=status, content=payload)
+
+
+@app.post(
+    "/api/v1/inventory/allocate",
+    response_model=AllocateResponse,
+    tags=["库存"],
+    summary="试剂批次分配：按失效日期优先（FEFO）、同日批号升序领用有效物质",
+    responses={
+        400: {"description": "待领用物种化学式解析失败"},
+        422: {"description": "需求或批次数据非法：批号重复、纯度/摩尔数/日期/状态非法"},
+    },
+)
+async def inventory_allocate(request: AllocateRequest):
+    status, payload = process_allocate(
+        request.species,
+        request.required_moles,
+        request.as_of_date,
+        [item.model_dump() for item in request.batches],
     )
     return JSONResponse(status_code=status, content=payload)
 
