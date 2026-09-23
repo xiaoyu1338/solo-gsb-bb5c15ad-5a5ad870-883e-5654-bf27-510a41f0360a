@@ -18,7 +18,11 @@
    物种摩尔库存出发，每步以全部反应物的当前库存计算最大反应进度，扣减消耗、
    加入产物并把更新后的库存传给下一步（库存不足则该步零进度继续并标出全部
    阻塞反应物），全程精确有理数运算；
-8. 对同一规范化反应做幂等缓存，重复请求返回相同的 `reaction_id` 与结果。
+8. `/inventory/allocate` 做试剂批次 **FEFO 领用分配**：提交待领用物种的有效
+   摩尔需求与带批号/纯度/名义摩尔数/失效日期/状态的库存批次及核算日期，
+   服务按失效日期优先、同日批号升序跨批次扣减（名义量 × 纯度换算有效物质），
+   跳过已过期与隔离批次，返回每批领用/余量、未满足需求与汇总状态；
+9. 对同一规范化反应做幂等缓存，重复请求返回相同的 `reaction_id` 与结果。
 
 ---
 
@@ -65,6 +69,25 @@ curl -X POST http://localhost:8000/api/v1/stoichiometry/plan \
        "targets":[{"species":"NH3","moles":"4"}]}'
 ```
 
+试剂批次领用分配——按失效日期优先（FEFO）跨批领用 1.5 mol 有效 HCl：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/inventory/allocate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "demands": [{"species": "HCl", "effective_moles": "1.5"}],
+    "batches": [
+      {"batch_no": "A-1", "species": "HCl", "purity": "0.75",
+       "nominal_moles": "1", "expires_on": "2026-10-01", "status": "available"},
+      {"batch_no": "A-2", "species": "HCl", "purity": "1",
+       "nominal_moles": "2", "expires_on": "2026-11-01", "status": "available"},
+      {"batch_no": "OLD", "species": "HCl", "purity": "1",
+       "nominal_moles": "8", "expires_on": "2020-01-01", "status": "available"}
+    ],
+    "accounting_date": "2026-09-23"
+  }'
+```
+
 ### 不用 Docker 的本地运行方式
 
 ```bash
@@ -77,7 +100,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ```bash
 pip install -r requirements-dev.txt
-pytest          # 206 个测试
+pytest          # 241 个测试
 ```
 
 ---
@@ -92,6 +115,7 @@ pytest          # 206 个测试
 | POST | `/api/v1/stoichiometry/batch` | 投料摩尔数批量计量：反应进度、并列限量试剂、消耗/剩余与理论产量 |
 | POST | `/api/v1/stoichiometry/plan` | 反向投料规划：按生成物目标摩尔数求最小反应进度、理论投料需求与达成/超额量 |
 | POST | `/api/v1/stoichiometry/sequence` | 连续反应推演：多步反应按顺序消耗/产出，逐步传递库存，返回各步明细与最终库存 |
+| POST | `/api/v1/inventory/allocate` | 试剂批次 FEFO 领用分配：按失效日期优先、同日批号升序跨批次扣减，跳过过期/隔离批次，返回每批领用/余量、未满足需求与汇总状态 |
 | GET | `/api/v1/reactions/{reaction_id}` | 按幂等 ID 取回之前的结果 |
 | GET | `/health` | 健康检查 |
 
@@ -512,7 +536,130 @@ curl -X POST http://localhost:8000/api/v1/stoichiometry/sequence \
 | `steps` 为空、缺字段、化学式为空白等请求体问题 | `422 INVALID_REQUEST` |
 | 初始库存摩尔数非法（详情 `details.invalid_moles`） | `422 INVALID_REQUEST` |
 
-### 2.7 幂等与查询
+### 2.7 试剂批次领用分配 `POST /api/v1/inventory/allocate`
+
+提交**待领用物种的有效摩尔需求**、一组库存批次（批号、纯度、可用名义摩尔数、
+失效日期、状态）与**核算日期**，服务按 FEFO（先到期先出）规则分配：
+
+* 同一物种的可用批次按 **失效日期升序**、同日按 **批号字符串升序** 排序后依次领用；
+* 每批的有效物质 = **名义摩尔数 × 纯度**；从一批领用的名义摩尔数 =
+  有效领用 ÷ 纯度，因此不会超过该批有效余量；
+* **已过期**（`expires_on < accounting_date`，恰为核算日当天不算过期）、
+  **隔离**（`status="quarantined"`）与**可用名义量为 0** 的批次跳过，不参与扣减；
+* 需求可**跨多个批次拆分**；批号在单次请求内必须全局唯一（同一批次不得重复扣减）；
+* 物种不在 `demands` 中的批次整批保留，单独列入 `unmatched_batches`；
+* 所有数值以精确有理数运算（全程不经过 `float`），输出为十进制字符串；
+  无限小数按 28 位有效数字银行家舍入，规则同其它计量接口。
+
+请求体：
+
+```json
+{
+  "demands": [
+    {"species": "HCl", "effective_moles": "1.5"}
+  ],
+  "batches": [
+    {"batch_no": "A-1", "species": "HCl", "purity": "0.75",
+     "nominal_moles": "1", "expires_on": "2026-10-01", "status": "available"},
+    {"batch_no": "A-2", "species": "HCl", "purity": "1",
+     "nominal_moles": "2", "expires_on": "2026-11-01", "status": "available"},
+    {"batch_no": "OLD", "species": "HCl", "purity": "1",
+     "nominal_moles": "8", "expires_on": "2020-01-01", "status": "available"}
+  ],
+  "accounting_date": "2026-09-23"
+}
+```
+
+字段约束：
+
+| 字段 | 约束 |
+| --- | --- |
+| `demands` | 至少 1 条；`species` 为可解析化学式且同物种不得重复；`effective_moles` 为**非负十进制字符串**（JSON 数字会被拒绝） |
+| `batches[].batch_no` | 非空字符串，单次请求内全局唯一 |
+| `batches[].species` | 可解析化学式；等价写法（括号/空白/电荷风格）识别为同一物种 |
+| `batches[].purity` | 纯度十进制字符串，必须满足 **0 < purity ≤ 1**（如 `"0.98"`、`"1.0"`） |
+| `batches[].nominal_moles` | 可用名义摩尔数，**非负十进制字符串** |
+| `batches[].expires_on` | 失效日期 `YYYY-MM-DD` |
+| `batches[].status` | `"available"` 或 `"quarantined"` |
+| `accounting_date` | 核算日期 `YYYY-MM-DD`，必填 |
+
+`200` 响应（节选；上例中过期批 `OLD` 跳过，`A-1` 有效 0.75 耗尽后再从
+`A-2` 领有效 0.75 = 名义 0.75）：
+
+```json
+{
+  "as_of": "2026-09-23",
+  "allocations": [
+    {
+      "species": "HCl",
+      "normalized": "HCl",
+      "requested_effective_moles": "1.5",
+      "allocated_effective_moles": "1.5",
+      "unmet_effective_moles": "0",
+      "status": "fulfilled",
+      "batches": [
+        {"batch_no": "OLD", "expires_on": "2020-01-01", "status": "available",
+         "purity": "1", "nominal_moles": "8", "effective_moles": "8",
+         "eligible": false, "skipped": true, "skip_reason": "expired", "used": false,
+         "allocated_nominal_moles": "0", "allocated_effective_moles": "0",
+         "remaining_nominal_moles": "8", "remaining_effective_moles": "8"},
+        {"batch_no": "A-1", "expires_on": "2026-10-01", "status": "available",
+         "purity": "0.75", "nominal_moles": "1", "effective_moles": "0.75",
+         "eligible": true, "skipped": false, "skip_reason": null, "used": true,
+         "allocated_nominal_moles": "1", "allocated_effective_moles": "0.75",
+         "remaining_nominal_moles": "0", "remaining_effective_moles": "0"},
+        {"batch_no": "A-2", "expires_on": "2026-11-01", "status": "available",
+         "purity": "1", "nominal_moles": "2", "effective_moles": "2",
+         "eligible": true, "skipped": false, "skip_reason": null, "used": true,
+         "allocated_nominal_moles": "0.75", "allocated_effective_moles": "0.75",
+         "remaining_nominal_moles": "1.25", "remaining_effective_moles": "1.25"}
+      ]
+    }
+  ],
+  "unmatched_batches": [],
+  "summary": {
+    "total_requested_effective_moles": "1.5",
+    "total_allocated_effective_moles": "1.5",
+    "total_unmet_effective_moles": "0",
+    "demands_total": 1,
+    "fulfilled_demands": 1,
+    "shortage_demands": 0,
+    "batches_total": 3,
+    "batches_used": 2,
+    "batches_skipped": 1,
+    "unmatched_batches": 0,
+    "status": "fulfilled"
+  }
+}
+```
+
+字段说明：
+
+| 字段 | 含义 |
+| --- | --- |
+| `allocations[]` | 按规范化化学式排序的各物种分配；`batches` 为该物种的**全部提交批次**（含跳过批次），按（失效日期, 批号）排序 |
+| `allocations[].status` | `fulfilled`（`unmet_effective_moles="0"`）或 `shortage` |
+| `batches[].effective_moles` | 该批有效摩尔 = 名义摩尔 × 纯度 |
+| `batches[].allocated_nominal_moles` / `allocated_effective_moles` | 从该批领用的名义 / 有效摩尔（名义 = 有效 ÷ 纯度） |
+| `batches[].remaining_nominal_moles` / `remaining_effective_moles` | 领用后余量；跳过批次原样保留 |
+| `batches[].skip_reason` | `expired`（已过期）/ `quarantined`（隔离）/ `exhausted`（名义量为 0）/ `null`（正常批次）；既隔离又过期时报 `quarantined` |
+| `unmatched_batches[]` | 物种不在 `demands` 中的批次，`skip_reason` 恒为 `unmatched_species`，按（规范化物种, 失效日期, 批号）排序 |
+| `summary` | 跨物种需求/满足/未满足合计、需求与批次计数及总体 `status`（任一物种短缺即为 `shortage`） |
+
+错误响应：
+
+| 场景 | HTTP / code |
+| --- | --- |
+| 需求物种或批次物种化学式无法解析（`details.field` 指出 `demands.species` / `batches.species`，后者附 `batch_no`） | `400 FORMULA_PARSE_ERROR` |
+| 需求物种重复（`details.duplicate_demand_species`）、批号重复（`details.duplicate_batch_nos`） | `422 INVALID_INVENTORY` |
+| 纯度非法（非 (0,1]、NaN、无穷、非数字；`details.invalid_purity`） | `422 INVALID_INVENTORY` |
+| 有效/名义摩尔非法（负数、NaN、非数字；`details.invalid_effective_moles` / `details.invalid_nominal_moles`） | `422 INVALID_INVENTORY` |
+| 摩尔数/纯度传成 JSON 数字、日期格式错误、状态非 available/quarantined、列表为空或缺字段、空白字符串 | `422 INVALID_REQUEST` |
+
+该接口为无状态计算（不读写幂等缓存、不持久化扣减结果）；同一请求重复调用
+得到完全一致的分配。
+
+### 2.8 幂等与查询
 
 * 幂等键与书写顺序、括号风格、空白以及电荷的等价写法无关，只取决于每一侧
   物种的 **（元素组成多重集, 电荷）**。
@@ -584,12 +731,13 @@ LCM），热循环只剩整数乘加；自由变量最多 3 个、系数上限 3
 | --- | --- | --- |
 | `FORMULA_PARSE_ERROR` | 400 | 化学式无法解析（未知元素、括号不匹配、电荷非法等） |
 | `DUPLICATE_SPECIES` | 409 | 同一侧出现重复物种 |
-| `INVALID_REQUEST` | 422 | 请求体缺失/为空/物种过多（>100）；`/stoichiometry/batch` 投料缺失、重复、含未知物种或摩尔数非法（含 JSON 数字）；`/stoichiometry/plan` 目标重复、含非生成物物种或摩尔数非法；`/stoichiometry/sequence` 步骤为空、库存摩尔数非法（结构化错误的 `details.step` 另标出出错步骤） |
+| `INVALID_REQUEST` | 422 | 请求体缺失/为空/物种过多（>100）；`/stoichiometry/batch` 投料缺失、重复、含未知物种或摩尔数非法（含 JSON 数字）；`/stoichiometry/plan` 目标重复、含非生成物物种或摩尔数非法；`/stoichiometry/sequence` 步骤为空、库存摩尔数非法（结构化错误的 `details.step` 另标出出错步骤）；`/inventory/allocate` 请求体结构问题（缺字段、空列表、日期格式错误、状态枚举非法、数字代替十进制字符串等） |
 | `IMPOSSIBLE_BALANCE` | 422 | 守恒方程组无解（含电荷无法守恒） |
 | `NON_UNIQUE_BALANCE` | 422 | 零空间维数 > 1，配平不唯一（返回 `nullity` 与自由度） |
 | `ZERO_COEFFICIENT` | 422 | 唯一解要求某些物种系数为 0 |
 | `INVALID_STOICHIOMETRY` | 422 | 唯一解符号不一致，物种可能需要换边 |
 | `VARIANT_SPACE_TOO_LARGE` | 422 | `/balance/variants` 零空间维数（自由变量数）> 3，枚举空间过大（返回 `nullity`） |
+| `INVALID_INVENTORY` | 422 | `/inventory/allocate` 需求物种或批号重复、纯度不在 (0,1]、有效/名义摩尔数非法（含 JSON 数字）或批次状态未知，问题明细在 `details` 中聚合返回 |
 | `NOT_FOUND` | 404 | `reaction_id` 不在缓存中 |
 
 不唯一示例：`C + O2 -> CO + CO2` 缺少约束，返回
@@ -614,10 +762,11 @@ app/
   balancer.py       守恒矩阵、有理数 RREF、零空间、最小正整数、多变体枚举、守恒视图
   cache.py          规范化签名（SHA-256）与 LRU 幂等缓存
   stoichiometry.py  投料量 -> 反应进度（正向批量计量）、目标产量 -> 最小反应进度/理论投料（反向规划）与多步连续反应库存推演，Decimal/Fraction 精确计算
+  allocation.py     试剂批次 FEFO 领用分配：纯度换算有效物质、跨批拆分、过期/隔离跳过、未满足需求与汇总，Fraction 精确计算
   service.py        业务编排与响应组装
   models.py         Pydantic 请求/响应模型
   main.py           FastAPI 路由与异常处理
-tests/              解析器、配平核心、HTTP API、批量计量、反向投料规划、连续反应推演共 206 个测试
+tests/              解析器、配平核心、HTTP API、批量计量、反向投料规划、连续反应推演、试剂批次领用分配共 241 个测试
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt

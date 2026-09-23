@@ -12,6 +12,9 @@
 * ``POST /stoichiometry/sequence`` 多步连续反应推演：按顺序执行多步
   反应，基于初始物种库存逐步计算最大反应进度、扣减消耗、加入产物，
   返回各步明细与最终库存；
+* ``POST /inventory/allocate`` 试剂批次 FEFO 领用分配：按失效日期优先、
+  同日批号升序跨批次扣减（名义量×纯度换算有效物质），跳过过期/隔离批次，
+  返回每批领用/余量、未满足需求与汇总状态；
 * ``GET  /reactions/{reaction_id}``  按幂等 ID 取回结果；
 * ``GET  /health``   健康检查。
 """
@@ -24,6 +27,8 @@ from fastapi.responses import JSONResponse
 
 from . import __version__
 from .models import (
+    AllocateRequest,
+    AllocateResponse,
     AnalyzeResponse,
     BalanceResponse,
     ReactionRequest,
@@ -39,6 +44,7 @@ from .models import (
 from .service import (
     STATUS_CODES,
     get_reaction,
+    process_allocate,
     process_analyze,
     process_balance,
     process_reverse_plan,
@@ -51,7 +57,8 @@ app = FastAPI(
     title="化学反应计量平衡服务",
     description=(
         "解析含元素、括号与电荷的化学式，建立元素守恒与电荷守恒矩阵，"
-        "通过有理数高斯-若尔当消元求解最小互质正整数系数。"
+        "通过有理数高斯-若尔当消元求解最小互质正整数系数；"
+        "并提供限量试剂计量、连续反应推演与试剂批次 FEFO 领用分配。"
     ),
     version=__version__,
 )
@@ -76,7 +83,9 @@ async def handle_validation_error(request: Request, exc: RequestValidationError)
         content={
             "error": {
                 "code": "INVALID_REQUEST",
-                "message": "请求体校验失败：请提供非空的 reactants 与 products 字符串数组",
+                "message": "请求体校验失败：请检查必填字段、字段类型与取值范围"
+                "（摩尔数/纯度须为十进制字符串、日期须为 YYYY-MM-DD、"
+                "状态只能为 available 或 quarantined）",
                 "details": {"validation": _jsonable_errors(exc.errors())},
             }
         },
@@ -186,6 +195,28 @@ async def stoichiometry_sequence(request: SequenceRequest):
     status, payload = process_sequence(
         [item.model_dump() for item in request.steps],
         [item.model_dump() for item in request.initial_inventory],
+    )
+    return JSONResponse(status_code=status, content=payload)
+
+
+@app.post(
+    "/api/v1/inventory/allocate",
+    response_model=AllocateResponse,
+    tags=["库存"],
+    summary="试剂批次 FEFO 领用分配：按失效日期优先、同日批号升序跨批次扣减",
+    responses={
+        400: {"description": "领用物种或批次物种化学式无法解析"},
+        422: {"description": "需求/批号重复、摩尔数或纯度非法、状态未知或请求体结构非法"},
+    },
+)
+async def inventory_allocate(request: AllocateRequest):
+    status, payload = process_allocate(
+        [item.model_dump() for item in request.demands],
+        [
+            {**item.model_dump(), "expires_on": item.expires_on}
+            for item in request.batches
+        ],
+        request.accounting_date,
     )
     return JSONResponse(status_code=status, content=payload)
 

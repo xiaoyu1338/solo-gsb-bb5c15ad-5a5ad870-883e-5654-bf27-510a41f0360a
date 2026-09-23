@@ -2,10 +2,19 @@
 
 from __future__ import annotations
 
+from datetime import date
 from decimal import Decimal, InvalidOperation
 from fractions import Fraction
 from typing import Any
 
+from .allocation import (
+    BATCH_STATUSES,
+    Batch,
+    Demand,
+    allocate,
+    parse_purity,
+    render_allocation,
+)
 from .balancer import (
     VARIANT_SPACE_TOO_LARGE,
     BalanceError,
@@ -39,6 +48,7 @@ STATUS_CODES = {
     "INVALID_STOICHIOMETRY": 422,
     "CHARGE_NOT_CONSERVED": 422,
     VARIANT_SPACE_TOO_LARGE: 422,
+    "INVALID_INVENTORY": 422,
 }
 
 
@@ -749,3 +759,159 @@ def process_sequence(
         "steps": step_results,
         "final_inventory": _render_inventory(inventory, normalized_by_key),
     }
+
+
+# ------------------------------------------------------------ 试剂批次领用分配
+def process_allocate(
+    demand_items: list[dict[str, Any]],
+    batch_items: list[dict[str, Any]],
+    accounting_date: date,
+) -> tuple[int, dict[str, Any]]:
+    """试剂批次 FEFO 领用分配，返回 (http_status, payload)。
+
+    逐条解析领用需求（物种 + 非负有效摩尔）与库存批次（物种、0<纯度<=1、
+    非负名义摩尔、失效日期、状态），聚合全部可定位的输入问题：物种无法
+    解析沿用 400 FORMULA_PARSE_ERROR；需求物种重复、批号重复、纯度或摩尔
+    数非法、状态未知则汇总为 422 INVALID_INVENTORY。校验通过后调用
+    :func:`app.allocation.allocate` 按失效日期升序、同日批号升序分配，
+    过期/隔离/零可用量批次跳过，结果以十进制字符串渲染。
+    """
+    # ---- 领用需求
+    demands: list[Demand] = []
+    invalid_demand_moles: list[dict[str, str]] = []
+    duplicate_demands: list[str] = []
+    seen_demand_keys: set[str] = set()
+
+    for item in demand_items:
+        species_text = item["species"]
+        moles_text = item["effective_moles"]
+        try:
+            formula = parse_formula(species_text)
+        except FormulaError as exc:
+            return STATUS_CODES["FORMULA_PARSE_ERROR"], {
+                "error": error_payload(
+                    "FORMULA_PARSE_ERROR",
+                    str(exc),
+                    {"field": "demands.species", "input": species_text},
+                ),
+            }
+        key = formula.key
+        normalized = formula.normalized
+
+        if key in seen_demand_keys:
+            duplicate_demands.append(normalized)
+        seen_demand_keys.add(key)
+
+        try:
+            amount = parse_moles(moles_text)
+        except (ValueError, InvalidOperation):
+            invalid_demand_moles.append(
+                {"species": normalized, "effective_moles": moles_text}
+            )
+        else:
+            demands.append(
+                Demand(
+                    raw=species_text,
+                    normalized=normalized,
+                    key=key,
+                    moles=decimal_to_fraction(amount),
+                )
+            )
+
+    # ---- 库存批次
+    batches: list[Batch] = []
+    invalid_purity: list[dict[str, str]] = []
+    invalid_nominal: list[dict[str, str]] = []
+    invalid_status: list[dict[str, str]] = []
+    duplicate_batch_nos: list[str] = []
+    seen_batch_nos: set[str] = set()
+
+    for item in batch_items:
+        species_text = item["species"]
+        batch_no = item["batch_no"]
+        purity_text = item["purity"]
+        nominal_text = item["nominal_moles"]
+        status = item["status"]
+
+        try:
+            formula = parse_formula(species_text)
+        except FormulaError as exc:
+            return STATUS_CODES["FORMULA_PARSE_ERROR"], {
+                "error": error_payload(
+                    "FORMULA_PARSE_ERROR",
+                    str(exc),
+                    {"field": "batches.species", "batch_no": batch_no,
+                     "input": species_text},
+                ),
+            }
+
+        if batch_no in seen_batch_nos:
+            duplicate_batch_nos.append(batch_no)
+        seen_batch_nos.add(batch_no)
+
+        if status not in BATCH_STATUSES:
+            invalid_status.append({"batch_no": batch_no, "status": str(status)})
+
+        try:
+            purity = parse_purity(purity_text)
+        except (ValueError, InvalidOperation):
+            invalid_purity.append({"batch_no": batch_no, "purity": purity_text})
+            purity = None
+
+        try:
+            nominal = parse_moles(nominal_text)
+        except (ValueError, InvalidOperation):
+            invalid_nominal.append(
+                {"batch_no": batch_no, "nominal_moles": nominal_text}
+            )
+            nominal = None
+
+        if purity is not None and nominal is not None:
+            batches.append(
+                Batch(
+                    batch_no=batch_no,
+                    species_raw=species_text,
+                    normalized=formula.normalized,
+                    key=formula.key,
+                    purity=decimal_to_fraction(purity),
+                    nominal_moles=decimal_to_fraction(nominal),
+                    expires_on=item["expires_on"],
+                    status=status,
+                )
+            )
+
+    # ---- 聚合所有输入问题
+    if (
+        duplicate_demands
+        or invalid_demand_moles
+        or duplicate_batch_nos
+        or invalid_purity
+        or invalid_nominal
+        or invalid_status
+    ):
+        details: dict[str, Any] = {}
+        if duplicate_demands:
+            details["duplicate_demand_species"] = sorted(set(duplicate_demands))
+        if invalid_demand_moles:
+            details["invalid_effective_moles"] = invalid_demand_moles
+        if duplicate_batch_nos:
+            details["duplicate_batch_nos"] = sorted(set(duplicate_batch_nos))
+        if invalid_purity:
+            details["invalid_purity"] = invalid_purity
+        if invalid_nominal:
+            details["invalid_nominal_moles"] = invalid_nominal
+        if invalid_status:
+            details["invalid_status"] = invalid_status
+        return STATUS_CODES["INVALID_INVENTORY"], {
+            "error": error_payload(
+                "INVALID_INVENTORY",
+                "领用需求与库存批次必须合法：需求物种与批号均不得重复，"
+                "有效/名义摩尔数必须是非负十进制字符串（不能为 JSON 数字），"
+                "纯度必须是 (0, 1] 区间内的十进制字符串，状态只能为 "
+                "available 或 quarantined",
+                details,
+            ),
+        }
+
+    result = allocate(demands, batches, accounting_date)
+    return 200, render_allocation(result)

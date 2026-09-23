@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any
+from datetime import date
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -381,3 +382,207 @@ class SequenceResponse(BaseModel):
     final_inventory: list[SequenceInventoryItem] = Field(
         description="全部步骤执行完毕后的最终物种库存"
     )
+
+
+# ------------------------------------------------------------ 试剂批次领用分配
+class AllocationDemand(BaseModel):
+    """一条待领用物种及其有效摩尔需求。"""
+
+    species: str = Field(
+        ...,
+        min_length=1,
+        description="待领用物种化学式；等价写法（括号风格、空白、电荷写法不同）"
+        "会识别为同一物种",
+        examples=["HCl"],
+    )
+    effective_moles: str = Field(
+        ...,
+        min_length=1,
+        description="需要领用的**有效摩尔数**十进制字符串（如 \"1.5\"、\"0\"、"
+        "\"1e-3\"），不要传 JSON 数字以避免浮点误差；服务以 名义量 × 纯度 换算有效物质",
+        examples=["2.0"],
+    )
+
+    @field_validator("species", "effective_moles")
+    @classmethod
+    def _strip_text(cls, value: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError("必须是字符串")
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("不能为空白字符串")
+        return stripped
+
+
+class InventoryBatch(BaseModel):
+    """一条带批号、纯度、可用名义摩尔数、失效日期与状态的库存批次。"""
+
+    batch_no: str = Field(
+        ...,
+        min_length=1,
+        description="库存批号；在单次请求内必须全局唯一，同一批号不得重复提交"
+        "（同一批次不得重复扣减）",
+        examples=["B-2025-001"],
+    )
+    species: str = Field(
+        ...,
+        min_length=1,
+        description="批次内试剂化学式；等价写法（括号风格、空白、电荷写法不同）"
+        "会识别为同一物种",
+        examples=["HCl"],
+    )
+    purity: str = Field(
+        ...,
+        min_length=1,
+        description="纯度（质量/摩尔分数）十进制字符串，必须在 (0, 1] 区间内"
+        "（如 \"0.98\"、\"1.0\"）；有效摩尔 = 名义摩尔 × 纯度",
+        examples=["0.98"],
+    )
+    nominal_moles: str = Field(
+        ...,
+        min_length=1,
+        description="该批可用**名义摩尔数**的非负十进制字符串"
+        "（如 \"5.0\"、\"0\"、\"1e-3\"），不要传 JSON 数字",
+        examples=["5.0"],
+    )
+    expires_on: date = Field(
+        ...,
+        description="批次失效日期，ISO 8601（YYYY-MM-DD）；早于 accounting_date"
+        "即视为已过期并跳过",
+        examples=["2026-12-31"],
+    )
+    status: Literal["available", "quarantined"] = Field(
+        ...,
+        description="批次状态：available 可领用；quarantined 隔离中，跳过且不扣减",
+        examples=["available"],
+    )
+
+    @field_validator("batch_no", "species", "purity", "nominal_moles")
+    @classmethod
+    def _strip_text(cls, value: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError("必须是字符串")
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("不能为空白字符串")
+        return stripped
+
+
+class AllocateRequest(BaseModel):
+    """``POST /inventory/allocate`` 请求：领用需求、库存批次与核算日期。"""
+
+    demands: list[AllocationDemand] = Field(
+        ...,
+        min_length=1,
+        description="待领用物种及其有效摩尔需求，至少一条；同一物种不得重复",
+    )
+    batches: list[InventoryBatch] = Field(
+        ...,
+        description="库存批次；批号必须全局唯一。按失效日期升序、同日批号升序"
+        "（FEFO）分配，过期或隔离批次跳过，需求可跨批次拆分",
+    )
+    accounting_date: date = Field(
+        ...,
+        description="核算日期，ISO 8601（YYYY-MM-DD）；批次 expires_on 早于此日"
+        "即视为已过期（恰为同一天不算过期）",
+        examples=["2026-09-23"],
+    )
+
+
+class AllocationBatchLine(BaseModel):
+    """一个库存批次在某次分配中的扣减与余量明细。"""
+
+    batch_no: str = Field(description="库存批号（回显）")
+    species: str = Field(description="客户端提交的批次物种原始化学式")
+    normalized: str = Field(description="规范化后的物种化学式")
+    expires_on: str = Field(description="批次失效日期（YYYY-MM-DD）")
+    status: Literal["available", "quarantined"] = Field(description="批次状态（回显）")
+    purity: str = Field(description="纯度（十进制字符串）")
+    nominal_moles: str = Field(description="可用名义摩尔数（回显）")
+    effective_moles: str = Field(
+        description="该批可提供的有效摩尔 = 名义摩尔 × 纯度"
+    )
+    eligible: bool = Field(
+        description="核算日是否具备领用资格（未过期、未隔离且有效量大于 0）"
+    )
+    skipped: bool = Field(description="该批是否被跳过（未参与扣减）")
+    skip_reason: Literal["expired", "quarantined", "exhausted"] | None = Field(
+        description="跳过原因：expired 已过期 / quarantined 隔离 / exhausted "
+        "可用名义量为 0；实际领用的批次为 null"
+    )
+    used: bool = Field(description="该批是否实际承担了正的领用扣减")
+    allocated_nominal_moles: str = Field(
+        description="从该批领用的**名义**摩尔数 = 有效领用 ÷ 纯度；未领用为 \"0\""
+    )
+    allocated_effective_moles: str = Field(
+        description="从该批领用的**有效**摩尔数；未领用为 \"0\""
+    )
+    remaining_nominal_moles: str = Field(
+        description="领用后该批剩余名义摩尔数 = 名义量 − 名义领用"
+    )
+    remaining_effective_moles: str = Field(
+        description="领用后该批剩余有效摩尔 = 剩余名义量 × 纯度"
+    )
+
+
+class SpeciesAllocation(BaseModel):
+    """单个待领用物种的跨批次分配明细。"""
+
+    species: str = Field(description="客户端提交的原始化学式")
+    normalized: str = Field(description="规范化后的化学式")
+    requested_effective_moles: str = Field(description="请求的有效摩尔需求（回显）")
+    allocated_effective_moles: str = Field(
+        description="从全部批次实际领到的有效摩尔合计"
+    )
+    unmet_effective_moles: str = Field(
+        description="未满足的有效摩尔需求 = 需求 − 已分配（为 \"0\" 即全部满足）"
+    )
+    status: Literal["fulfilled", "shortage"] = Field(
+        description="fulfilled 需求全部满足；shortage 仍有未满足需求"
+    )
+    batches: list[AllocationBatchLine] = Field(
+        description="该物种的全部提交批次，按失效日期升序、同日批号升序排列，"
+        "逐批给出领用与余量（含被跳过的批次）"
+    )
+
+
+class UnmatchedBatch(AllocationBatchLine):
+    """物种未出现在领用需求中的批次；``skip_reason`` 恒为 unmatched_species。"""
+
+    skip_reason: Literal["unmatched_species"] = Field(
+        description="批次物种未出现在 demands 中，整批保留、未参与分配"
+    )
+
+
+class AllocationSummary(BaseModel):
+    total_requested_effective_moles: str = Field(
+        description="全部物种的有效摩尔需求合计"
+    )
+    total_allocated_effective_moles: str = Field(
+        description="全部物种实际领到的有效摩尔合计"
+    )
+    total_unmet_effective_moles: str = Field(description="未满足需求合计")
+    demands_total: int = Field(description="领用需求条数")
+    fulfilled_demands: int = Field(description="完全满足的需求条数")
+    shortage_demands: int = Field(description="未完全满足的需求条数")
+    batches_total: int = Field(description="请求提交的批次总数")
+    batches_used: int = Field(description="实际承担领用扣减的批次数")
+    batches_skipped: int = Field(
+        description="被跳过的批次数（过期、隔离或名义量为 0；不含物种未匹配批次）"
+    )
+    unmatched_batches: int = Field(description="物种未出现在 demands 中的批次数")
+    status: Literal["fulfilled", "shortage"] = Field(
+        description="汇总状态：全部需求满足为 fulfilled，否则为 shortage"
+    )
+
+
+class AllocateResponse(BaseModel):
+    as_of: str = Field(description="核算日期（YYYY-MM-DD，回显）")
+    allocations: list[SpeciesAllocation] = Field(
+        description="按规范化化学式排序的各物种分配明细；物种下批次按 FEFO 排序"
+    )
+    unmatched_batches: list[UnmatchedBatch] = Field(
+        description="物种未出现在 demands 中的批次（整批保留、未参与分配），"
+        "按规范化物种、失效日期、批号排序"
+    )
+    summary: AllocationSummary = Field(description="跨物种汇总与总体状态")
